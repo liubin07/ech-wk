@@ -833,6 +833,12 @@ class MainWindow(QMainWindow):
             color: #ffffff;
         }
 
+        QPushButton[text="启动代理"]:disabled {
+            background-color: #f8f8f8;
+            color: #cccccc;
+            border: 2px solid #e0e0e0;
+        }
+    
         /* 停止按钮特殊样式 - 红色 */
         QPushButton[text="停止"] {
             background-color: #f44336;
@@ -849,6 +855,12 @@ class MainWindow(QMainWindow):
         QPushButton[text="停止"]:pressed {
             background-color: #b71c1c;
             color: #ffffff;
+        }
+
+        QPushButton[text="停止"]:disabled {
+            background-color: #f8f8f8;
+            color: #cccccc;
+            border: 2px solid #e0e0e0;
         }
 
         /* 设置系统代理按钮样式 - 蓝色 */
