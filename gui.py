@@ -255,8 +255,11 @@ class ProcessThread(QThread):
             popen_kwargs = {
                 'stdout': subprocess.PIPE,
                 'stderr': subprocess.STDOUT,
+                'env': os.environ.copy(),
                 'bufsize': 1
             }
+            popen_kwargs['env']['NO_PROXY'] = '*'
+            popen_kwargs['env']['no_proxy'] = '*'
             
             # Windows: 使用 CREATE_NO_WINDOW 隐藏控制台
             if sys.platform == 'win32':
@@ -613,7 +616,7 @@ class MainWindow(QMainWindow):
 
         # 将标签页添加到主布局
         main_layout.addWidget(tab_widget)
-    
+
     def _create_matrix_icon(self):
         """创建简洁风格图标"""
         # 创建不同尺寸的图标
@@ -920,13 +923,6 @@ class MainWindow(QMainWindow):
             background-color: #0078d4;
             border: 2px solid #0078d4;
             image: none;
-        }
-
-        QCheckBox::indicator:checked::after {
-            content: "✓";
-            color: #ffffff;
-            font-size: 14px;
-            font-weight: bold;
         }
 
         /* 文本编辑框样式（日志） */
@@ -1990,11 +1986,100 @@ class MainWindow(QMainWindow):
                 self.append_log("[系统] 开机自动启动代理\n")
 
 
+import tempfile
+import atexit
+
+
 def main():
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
+    # Create a temporary lock file to ensure single instance (cross-platform)
+    lock_file = None
+    try:
+        # Create a unique lock file in the temp directory
+        lock_filename = os.path.join(tempfile.gettempdir(), 'ech_workers_gui.lock')
+
+        import errno
+        if sys.platform == 'win32':
+            # On Windows, use exclusive file creation
+            import msvcrt
+            lock_file = open(lock_filename, 'w')
+            try:
+                # Lock the file (this will raise exception if already locked)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except IOError as e:
+                if e.errno == errno.EDEADLOCK or e.errno == errno.EACCES or e.errno == errno.EAGAIN:
+                    # File is already locked by another process
+                    raise IOError("Another instance is already holding the lock")
+                else:
+                    raise
+        else:
+            # On Unix-like systems, use fcntl
+            import fcntl
+            lock_file = open(lock_filename, 'w')
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        # Write the current process ID to the lock file
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+
+        # Register cleanup function to be called at exit
+        def cleanup_lock():
+            try:
+                if lock_file:
+                    if sys.platform == 'win32':
+                        import msvcrt
+                        try:
+                            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                        except:
+                            pass
+                    else:
+                        import fcntl
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+                    lock_file.close()
+                    try:
+                        os.unlink(lock_filename)
+                    except:
+                        pass
+            except:
+                pass
+
+        atexit.register(cleanup_lock)
+
+        # If we successfully acquired the lock, continue with the application
+        app = QApplication(sys.argv)
+        window = MainWindow()
+        window.show()
+        result = app.exec_()
+
+        sys.exit(result)
+
+    except IOError:
+        # Another instance is already running
+        print("另一个 ECH Workers 客户端实例已经在运行中。")
+
+        # Show a message box to the user if GUI is available
+        try:
+            app = QApplication.instance()
+            if app is None:
+                app = QApplication(sys.argv)
+
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("警告")
+            msg.setText("另一个 ECH Workers 客户端实例已经在运行中。")
+            msg.setInformativeText("请关闭之前的实例后再启动新的实例。")
+            msg.exec_()
+        except:
+            pass  # If GUI initialization fails, just print to console
+
+        # Close the lock file if it was opened
+        if lock_file:
+            try:
+                lock_file.close()
+            except:
+                pass
+
+        sys.exit(1)
 
 
 if __name__ == '__main__':
