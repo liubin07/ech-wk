@@ -1,5 +1,23 @@
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
+
+// ==================== 环境变量配置说明 ====================
+// 在 Cloudflare Dashboard -> Workers -> 设置 -> 变量 中配置以下环境变量：
+//
+// TOKEN      - 身份验证令牌（可选，留空表示不验证）
+// PROXYIP    - 自定义反代地址（可选，支持 IP 或域名，多个用逗号分隔）
+//              例如: 'proxyip.cmliussss.net' 或 '1.2.3.4' 或 'ip1.com,ip2.com'
+//
+// 如果不配置环境变量，将使用下方的默认值
+// ===========================================================
+
+// 默认公共 PROXYIP 列表（当环境变量 PROXYIP 为空时使用）
+const DEFAULT_PROXYIP_LIST = [
+  'proxyip.cmliussss.net',      // cmliu 维护的公共 proxyIP
+  'proxyip.fxxk.dedyn.io',      // fxxk 维护的公共 proxyIP
+];
+
+// CF Fallback IPs（最后的尝试，效果有限）
 const CF_FALLBACK_IPS = ['[2a00:1098:2b::1:6815:5881]'];
 
 // 复用 TextEncoder，避免重复创建
@@ -10,11 +28,14 @@ import { connect } from 'cloudflare:sockets';
 export default {
   async fetch(request, env, ctx) {
     try {
-      const token = '';
+      // 从环境变量读取配置，如果未设置则使用默认值
+      const token = env.TOKEN || '';
+      const proxyIP = env.PROXYIP || '';
+
       const upgradeHeader = request.headers.get('Upgrade');
-      
+
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
-        return new URL(request.url).pathname === '/' 
+        return new URL(request.url).pathname === '/'
           ? new Response('WebSocket Proxy Server', { status: 200 })
           : new Response('Expected WebSocket', { status: 426 });
       }
@@ -25,39 +46,40 @@ export default {
 
       const [client, server] = Object.values(new WebSocketPair());
       server.accept();
-      
-      handleSession(server).catch(() => safeCloseWebSocket(server));
+
+      // 将 proxyIP 传递给 handleSession
+      handleSession(server, proxyIP).catch(() => safeCloseWebSocket(server));
 
       // 修复 spread 类型错误
       const responseInit = {
         status: 101,
         webSocket: client
       };
-      
+
       if (token) {
         responseInit.headers = { 'Sec-WebSocket-Protocol': token };
       }
 
       return new Response(null, responseInit);
-      
+
     } catch (err) {
       return new Response(err.toString(), { status: 500 });
     }
   },
 };
 
-async function handleSession(webSocket) {
+async function handleSession(webSocket, proxyIP) {
   let remoteSocket, remoteWriter, remoteReader;
   let isClosed = false;
 
   const cleanup = () => {
     if (isClosed) return;
     isClosed = true;
-    
-    try { remoteWriter?.releaseLock(); } catch {}
-    try { remoteReader?.releaseLock(); } catch {}
-    try { remoteSocket?.close(); } catch {}
-    
+
+    try { remoteWriter?.releaseLock(); } catch { }
+    try { remoteReader?.releaseLock(); } catch { }
+    try { remoteSocket?.close(); } catch { }
+
     remoteWriter = remoteReader = remoteSocket = null;
     safeCloseWebSocket(webSocket);
   };
@@ -66,15 +88,15 @@ async function handleSession(webSocket) {
     try {
       while (!isClosed && remoteReader) {
         const { done, value } = await remoteReader.read();
-        
+
         if (done) break;
         if (webSocket.readyState !== WS_READY_STATE_OPEN) break;
         if (value?.byteLength > 0) webSocket.send(value);
       }
-    } catch {}
-    
+    } catch { }
+
     if (!isClosed) {
-      try { webSocket.send('CLOSE'); } catch {}
+      try { webSocket.send('CLOSE'); } catch { }
       cleanup();
     }
   };
@@ -96,20 +118,53 @@ async function handleSession(webSocket) {
 
   const isCFError = (err) => {
     const msg = err?.message?.toLowerCase() || '';
-    return msg.includes('proxy request') || 
-           msg.includes('cannot connect') || 
-           msg.includes('cloudflare');
+    return msg.includes('proxy request') ||
+      msg.includes('cannot connect') ||
+      msg.includes('cloudflare');
   };
 
   const connectToRemote = async (targetAddr, firstFrameData) => {
     const { host, port } = parseAddress(targetAddr);
-    const attempts = [null, ...CF_FALLBACK_IPS];
+
+    // 构建尝试列表：直连 -> 用户 PROXYIP -> 默认 PROXYIP -> CF_FALLBACK
+    const attempts = [null]; // null 表示直连目标
+
+    // 添加用户配置的 PROXYIP（从环境变量传入）
+    if (proxyIP) {
+      proxyIP.split(',').forEach(ip => {
+        const trimmed = ip.trim();
+        if (trimmed) attempts.push(trimmed);
+      });
+    }
+
+    // 添加默认公共 PROXYIP 列表
+    attempts.push(...DEFAULT_PROXYIP_LIST);
+
+    // 最后添加 CF Fallback IPs
+    attempts.push(...CF_FALLBACK_IPS);
 
     for (let i = 0; i < attempts.length; i++) {
       try {
+        // 解析连接目标
+        let connectHost = host;
+        let connectPort = port;
+
+        if (attempts[i]) {
+          // 使用 PROXYIP 作为跳板，但保持原始目标端口
+          const proxyAddr = attempts[i];
+          if (proxyAddr.includes(':')) {
+            // 带端口的 PROXYIP
+            const proxyParsed = parseAddress(proxyAddr);
+            connectHost = proxyParsed.host;
+            // 对于 PROXYIP，使用原始目标端口（443）而非 PROXYIP 自己的端口
+          } else {
+            connectHost = proxyAddr;
+          }
+        }
+
         remoteSocket = connect({
-          hostname: attempts[i] || host,
-          port
+          hostname: connectHost,
+          port: connectPort
         });
 
         if (remoteSocket.opened) await remoteSocket.opened;
@@ -128,15 +183,16 @@ async function handleSession(webSocket) {
 
       } catch (err) {
         // 清理失败的连接
-        try { remoteWriter?.releaseLock(); } catch {}
-        try { remoteReader?.releaseLock(); } catch {}
-        try { remoteSocket?.close(); } catch {}
+        try { remoteWriter?.releaseLock(); } catch { }
+        try { remoteReader?.releaseLock(); } catch { }
+        try { remoteSocket?.close(); } catch { }
         remoteWriter = remoteReader = remoteSocket = null;
 
         // 如果不是 CF 错误或已是最后尝试，抛出错误
         if (!isCFError(err) || i === attempts.length - 1) {
           throw err;
         }
+        // 否则继续尝试下一个 PROXYIP
       }
     }
   };
@@ -168,7 +224,7 @@ async function handleSession(webSocket) {
         await remoteWriter.write(new Uint8Array(data));
       }
     } catch (err) {
-      try { webSocket.send('ERROR:' + err.message); } catch {}
+      try { webSocket.send('ERROR:' + err.message); } catch { }
       cleanup();
     }
   });
@@ -179,9 +235,9 @@ async function handleSession(webSocket) {
 
 function safeCloseWebSocket(ws) {
   try {
-    if (ws.readyState === WS_READY_STATE_OPEN || 
-        ws.readyState === WS_READY_STATE_CLOSING) {
+    if (ws.readyState === WS_READY_STATE_OPEN ||
+      ws.readyState === WS_READY_STATE_CLOSING) {
       ws.close(1000, 'Server closed');
     }
-  } catch {}
+  } catch { }
 }
